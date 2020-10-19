@@ -1,18 +1,22 @@
-import discord
-import logging
 import asyncio
-import re
-from typing import List, Union, Tuple, Pattern
+import logging
+from typing import List, Pattern, Tuple, Union
 
+import discord
 from discord.ext.commands.converter import Converter, IDConverter, RoleConverter
 from discord.ext.commands.errors import BadArgument
-from redbot.core.i18n import Translator
 from redbot.core import commands
-from redbot.core.utils.predicates import ReactionPredicate
+from redbot.core.i18n import Translator
 from redbot.core.utils.menus import start_adding_reactions
+from redbot.core.utils.predicates import ReactionPredicate
 
 log = logging.getLogger("red.trusty-cogs.ReTrigger")
 _ = Translator("ReTrigger", __file__)
+
+try:
+    import regex as re
+except ImportError:
+    import re
 
 
 class MultiResponse(Converter):
@@ -34,6 +38,7 @@ class MultiResponse(Converter):
             "text",
             "filter",
             "delete",
+            "publish",
             "react",
             "rename",
             "command",
@@ -58,6 +63,8 @@ class MultiResponse(Converter):
             raise BadArgument(_('I require "Manage Roles" permission to use that.'))
         if result[0] == "filter" and not my_perms.manage_messages:
             raise BadArgument(_('I require "Manage Messages" permission to use that.'))
+        if result[0] == "publish" and not my_perms.manage_messages:
+            raise BadArgument(_('I require "Manage Messages" permission to use that.'))
         if result[0] == "ban" and not my_perms.ban_members:
             raise BadArgument(_('I require "Ban Members" permission to use that.'))
         if result[0] == "kick" and not my_perms.kick_members:
@@ -79,12 +86,18 @@ class MultiResponse(Converter):
                 raise BadArgument(_("Not creating trigger."))
             if not pred.result:
                 raise BadArgument(_("Not creating trigger."))
+
+        def author_perms(ctx: commands.Context, role: discord.Role) -> bool:
+            if ctx.author.id == ctx.guild.owner.id:
+                return True
+            return role < ctx.author.top_role
+
         if result[0] in ["add_role", "remove_role"]:
             good_roles = []
             for r in result[1:]:
                 try:
                     role = await RoleConverter().convert(ctx, r)
-                    if role < ctx.guild.me.top_role and role < ctx.author.top_role:
+                    if role < ctx.guild.me.top_role and author_perms(ctx, role):
                         good_roles.append(role.id)
                 except BadArgument:
                     log.error("Role `{}` not found.".format(r))
@@ -106,7 +119,7 @@ class MultiResponse(Converter):
 
 class Trigger:
     """
-        Trigger class to handle trigger objects
+    Trigger class to handle trigger objects
     """
 
     name: str
@@ -125,10 +138,14 @@ class Trigger:
     ignore_edits: bool
     ocr_search: bool
     delete_after: int
+    read_filenames: bool
 
     def __init__(self, name, regex, response_type, author, **kwargs):
         self.name = name
-        self.regex = re.compile(regex)
+        try:
+            self.regex = re.compile(regex)
+        except Exception:
+            raise
         self.response_type = response_type
         self.author = author
         self.enabled = kwargs.get("enabled", True)
@@ -144,6 +161,23 @@ class Trigger:
         self.ignore_edits = kwargs.get("ignore_edits", False)
         self.ocr_search = kwargs.get("ocr_search", False)
         self.delete_after = kwargs.get("delete_after", None)
+        self.read_filenames = kwargs.get("read_filenames", False)
+        self.chance = kwargs.get("chance", 0)
+
+    def enable(self):
+        """Explicitly enable this trigger"""
+        self.enabled = True
+
+    def disable(self):
+        """Explicitly disables this trigger"""
+        self.enabled = False
+
+    def toggle(self):
+        """Toggle whether or not this trigger is enabled."""
+        self.enabled = not self.enabled
+
+    def __repr__(self):
+        return "<ReTrigger name={0.name} author={0.author} pattern={0.regex.pattern}>".format(self)
 
     def __str__(self):
         """This is defined moreso for debugging purposes but may prove useful for elaborating
@@ -214,9 +248,9 @@ class Trigger:
             if role_response:
                 info += _("__Roles Removed__: ") + role_response + "\n"
         if self.whitelist:
-            info += _("__Whitelist__: ") + self.whitelist + "\n"
+            info += _("__Whitelist__: ") + ", ".join([str(i) for i in self.whitelist]) + "\n"
         if self.blacklist:
-            info += _("__Blacklist__: ") + self.blacklist + "\n"
+            info += _("__Blacklist__: ") + ", ".join([str(i) for i in self.blacklist]) + "\n"
         if self.cooldown:
             time = self.cooldown["time"]
             style = self.cooldown["style"]
@@ -225,8 +259,12 @@ class Trigger:
             info += _("OCR: **Enabled**\n")
         if self.ignore_edits:
             info += _("Ignoring edits: **Enabled**\n")
+        if self.chance:
+            info += _("__Chance__: **1 in {number}**\n").format(number=self.chance)
         if self.delete_after:
             info += _("Message deleted after: {time} seconds.\n").format(time=self.delete_after)
+        if self.read_filenames:
+            info += _("Read filenames: **Enabled**\n")
         info += _("__Regex__: ") + self.regex.pattern
         return info
 
@@ -249,6 +287,8 @@ class Trigger:
             "ignore_edits": self.ignore_edits,
             "ocr_search": self.ocr_search,
             "delete_after": self.delete_after,
+            "read_filenames": self.read_filenames,
+            "chance": self.chance,
         }
 
     @classmethod
@@ -261,6 +301,8 @@ class Trigger:
         ocr_search = False
         delete_after = None
         enabled = True
+        read_filenames = True
+        chance = 0
         if "cooldown" in data:
             cooldown = data["cooldown"]
         if type(data["response_type"]) is str:
@@ -281,6 +323,14 @@ class Trigger:
             delete_after = data["delete_after"]
         if "enabled" in data:
             enabled = data["enabled"]
+        if "read_filenames" in data:
+            read_filenames = data["read_filenames"]
+        if "delete" in response_type and type(data["text"]) == bool:
+            # replace old setting with new flag
+            read_filenames = data["text"]
+            data["text"] = ""
+        if "chance" in data:
+            chance = data["chance"]
         return cls(
             data["name"],
             data["regex"],
@@ -299,6 +349,8 @@ class Trigger:
             ignore_commands=ignore_commands,
             ignore_edits=ignore_edits,
             ocr_search=ocr_search,
+            read_filenames=read_filenames,
+            chance=chance,
         )
 
 

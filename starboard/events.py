@@ -1,10 +1,10 @@
-import discord
 import logging
+from typing import Dict, List, Literal, Union, cast
 
-from typing import List, cast, Dict, Union
-
-from redbot.core.bot import Red
+import discord
+from redbot import VersionInfo, version_info
 from redbot.core import Config, commands
+from redbot.core.bot import Red
 from redbot.core.i18n import Translator, cog_i18n
 
 from .message_entry import StarboardMessage
@@ -67,8 +67,8 @@ class StarboardEvents:
         self, starboard: StarboardEntry, member: Union[discord.Member, discord.User]
     ) -> bool:
         """Checks if the user is allowed to add to the starboard
-           Allows bot owner to always add messages for testing
-           disallows users from adding their own messages"""
+        Allows bot owner to always add messages for testing
+        disallows users from adding their own messages"""
         if isinstance(member, discord.User):
             return True
         user_roles = set([role.id for role in member.roles])
@@ -92,10 +92,20 @@ class StarboardEvents:
     ) -> bool:
         """CHecks if the channel is allowed to track starboard
         messages"""
+        if channel.is_nsfw() and not self.bot.get_channel(starboard.channel).is_nsfw():
+            return False
         if starboard.whitelist_channel:
-            return channel.id in starboard.whitelist_channel
+            if channel.id in starboard.whitelist_channel:
+                return True
+            if channel.category_id in starboard.whitelist_channel:
+                return True
+            return False
         else:
-            return channel.id not in starboard.blacklist_channel
+            if channel.id in starboard.blacklist_channel:
+                return False
+            if channel.category_id in starboard.blacklist_channel:
+                return False
+            return True
 
     async def _get_colour(self, channel: discord.TextChannel) -> discord.Colour:
         try:
@@ -111,13 +121,15 @@ class StarboardEvents:
     ) -> discord.Embed:
         channel = cast(discord.TextChannel, message.channel)
         author = message.author
-        if message.embeds != []:
+        if message.embeds:
             em = message.embeds[0]
-            if message.content != "":
+            if message.system_content:
                 if em.description != discord.Embed.Empty:
-                    em.description = "{}\n\n{}".format(message.content, em.description)[:2048]
+                    em.description = "{}\n\n{}".format(message.system_content, em.description)[
+                        :2048
+                    ]
                 else:
-                    em.description = message.content
+                    em.description = message.system_content
                 if not author.bot:
                     em.set_author(
                         name=author.display_name,
@@ -132,7 +144,7 @@ class StarboardEvents:
                 em.color = await self._get_colour(channel)
             else:
                 em.color = discord.Colour(starboard.colour)
-            em.description = message.content
+            em.description = message.system_content
             em.set_author(
                 name=author.display_name, url=message.jump_url, icon_url=str(author.avatar_url)
             )
@@ -156,15 +168,15 @@ class StarboardEvents:
         orig_channel = self.bot.get_channel(message_entry.original_channel)
         new_channel = self.bot.get_channel(message_entry.new_channel)
         try:
-            orig_msg = await orig_channel.get_message(message_entry.original_message)
-        except AttributeError:
             orig_msg = await orig_channel.fetch_message(message_entry.original_message)
+        except discord.errors.Forbidden:
+            return 0
         orig_reaction = [r for r in orig_msg.reactions if str(r.emoji) == str(starboard.emoji)]
         try:
             try:
-                new_msg = await new_channel.get_message(message_entry.new_message)
-            except AttributeError:
                 new_msg = await new_channel.fetch_message(message_entry.new_message)
+            except discord.errors.Forbidden:
+                return 0
             new_reaction = [r for r in new_msg.reactions if str(r.emoji) == str(starboard.emoji)]
             reactions = orig_reaction + new_reaction
         except discord.errors.NotFound:
@@ -174,7 +186,9 @@ class StarboardEvents:
             async for user in reaction.users():
                 if not await self._check_roles(starboard, user):
                     continue
-                if user.id not in unique_users:
+                if not starboard.selfstar and user.id == orig_msg.author.id:
+                    continue
+                if user.id not in unique_users and not user.bot:
                     unique_users.append(user.id)
         return len(unique_users)
 
@@ -206,10 +220,11 @@ class StarboardEvents:
         except AttributeError:
             # DMChannels don't have guilds
             return
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
         try:
             msg = await channel.fetch_message(id=payload.message_id)
-        except AttributeError:
-            msg = await channel.get_message(id=payload.message_id)
         except (discord.errors.NotFound, discord.Forbidden):
             return
         if guild.id not in self.starboards:
@@ -231,10 +246,11 @@ class StarboardEvents:
             return
         if guild.id not in self.starboards:
             return
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
         try:
             msg = await channel.fetch_message(id=payload.message_id)
-        except AttributeError:
-            msg = await channel.get_message(id=payload.message_id)
         except (discord.errors.NotFound, discord.Forbidden):
             return
         member = guild.get_member(payload.user_id)
@@ -278,6 +294,11 @@ class StarboardEvents:
             em = await self._build_embed(guild, msg, starboard)
             count_msg = "{} **#{}**".format(payload.emoji, count)
             post_msg = await star_channel.send(count_msg, embed=em)
+            if starboard.autostar:
+                try:
+                    await post_msg.add_reaction(starboard.emoji)
+                except Exception:
+                    log.exception("Error adding autostar.")
             if star_message.to_json() not in starboard.messages:
                 self.starboards[guild.id][starboard.name].messages.append(star_message.to_json())
             star_message = StarboardMessage(
@@ -285,6 +306,24 @@ class StarboardEvents:
             )
             self.starboards[guild.id][starboard.name].messages.append(star_message.to_json())
             await self._save_starboards(guild)
+
+    async def red_delete_data_for_user(
+        self,
+        *,
+        requester: Literal["discord_deleted_user", "owner", "user", "user_strict"],
+        user_id: int,
+    ):
+        """
+        Method for finding users data inside the cog and deleting it.
+        """
+        for guild_id, starboards in self.starboards.items():
+            for starboard, entry in starboards.items():
+                for message in entry.messages:
+                    if message["author"] == user_id:
+                        self.starboards[guild_id][starboard].messages.remove(message)
+            await self.config.guild_from_id(guild_id).starboards.set(
+                {n: s.to_json() for n, s in self.starboards[guild_id].items()}
+            )
 
     async def _loop_messages(
         self,
@@ -308,9 +347,7 @@ class StarboardEvents:
             if (same_message and same_channel) or (starboard_message and starboard_channel):
                 count = await self._get_count(messages, starboard)
                 try:
-                    message_edit = await star_channel.fetch_message(messages.new_message)
-                except AttributeError:
-                    message_edit = await star_channel.get_message(messages.new_message)  # type: ignore
+                    message_edit = await star_channel.fetch_message(messages.new_message)  # type: ignore
                     # This is for backwards compatibility for older Red
                 except (discord.errors.NotFound, discord.errors.Forbidden):
                     # starboard message may have been deleted
